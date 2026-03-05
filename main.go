@@ -9,11 +9,23 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/joho/godotenv"
+
 	"github.com/abasse/mongo-elastic/internal/config"
 	"github.com/abasse/mongo-elastic/internal/replicator"
 )
 
 func main() {
+	// ── Load .env file if present (no-op when the file doesn't exist) ─────────
+	// Variables already set in the environment always take precedence, so this
+	// is safe to leave enabled in any deployment: Docker / Kubernetes inject
+	// vars directly and will simply never have a .env file on disk.
+	if err := godotenv.Load(); err != nil && !os.IsNotExist(err) {
+		// A file was found but could not be parsed — treat that as a hard error.
+		slog.Error("failed to parse .env file", "error", err)
+		os.Exit(1)
+	}
+
 	// ── Structured JSON logger (goes to stdout for log aggregators) ───────────
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: logLevel(),
