@@ -228,7 +228,14 @@ func bsonToJSON(raw bson.Raw) ([]byte, error) {
 	if err := bson.Unmarshal(raw, &v); err != nil {
 		return nil, err
 	}
-	return json.Marshal(normalizeBSON(v))
+	v = normalizeBSON(v)
+	// Strip _id from the top-level document. Elasticsearch treats _id as a
+	// reserved metadata field and rejects documents that include it in the body.
+	// The value is already passed as the ES document ID, so removing it is safe.
+	if m, ok := v.(map[string]interface{}); ok {
+		delete(m, "_id")
+	}
+	return json.Marshal(v)
 }
 
 // normalizeBSON recursively converts BSON primitives to JSON-serialisable Go
