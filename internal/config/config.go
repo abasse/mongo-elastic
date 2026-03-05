@@ -44,6 +44,26 @@ type Config struct {
 	// How many events to batch before flushing the resume token on disk.
 	// Set to 1 for maximum durability (token saved after every event).
 	TokenSaveInterval int
+
+	// Full-sync options
+	//
+	// StartupFullSync (STARTUP_FULL_SYNC) forces a complete MongoDB→ES
+	// collection scan on the first startup iteration, before the change stream
+	// opens.  Safe because all operations are idempotent upserts.
+	// Use when you cannot guarantee the service was down for less time than
+	// the MongoDB oplog retention window.
+	StartupFullSync bool
+
+	// StaleTokenResync (STALE_TOKEN_RESYNC) enables automatic full-resync when
+	// the saved resume token is no longer present in the oplog (the service
+	// was down longer than the oplog window).  When disabled, the service logs
+	// the error and exits instead of resyncing.
+	// Default: true (recommended).
+	StaleTokenResync bool
+
+	// SyncBatchSize (SYNC_BATCH_SIZE) is the number of documents sent per
+	// Elasticsearch bulk request during a full sync (default 500).
+	SyncBatchSize int
 }
 
 // Load reads configuration from environment variables, applying defaults.
@@ -63,6 +83,9 @@ func Load() (*Config, error) {
 		InitialBackoff:    getEnvDuration("INITIAL_BACKOFF", 500*time.Millisecond),
 		MaxBackoff:        getEnvDuration("MAX_BACKOFF", 30*time.Second),
 		TokenSaveInterval: getEnvInt("TOKEN_SAVE_INTERVAL", 1),
+		StartupFullSync:  getEnvBool("STARTUP_FULL_SYNC", false),
+		StaleTokenResync: getEnvBool("STALE_TOKEN_RESYNC", true),
+		SyncBatchSize:    getEnvInt("SYNC_BATCH_SIZE", 500),
 	}
 
 	// Default ES index to collection name when not explicitly set.
@@ -124,6 +147,18 @@ func getEnvInt(key string, def int) int {
 		}
 	}
 	return def
+}
+
+func getEnvBool(key string, def bool) bool {
+	v := os.Getenv(key)
+	switch v {
+	case "true", "1", "yes":
+		return true
+	case "false", "0", "no":
+		return false
+	default:
+		return def
+	}
 }
 
 func getEnvDuration(key string, def time.Duration) time.Duration {

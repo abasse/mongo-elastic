@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/elastic/go-elasticsearch/v8"
@@ -65,13 +66,19 @@ type updateDescription struct {
 // Replicator watches a MongoDB collection and replicates every document change
 // into an Elasticsearch index.
 type Replicator struct {
-	cfg        *config.Config
-	logger     *slog.Logger
-	retryCfg   RetryConfig
+	cfg         *config.Config
+	logger      *slog.Logger
+	retryCfg    RetryConfig
 	mongoClient *mongo.Client
-	mongoColl  *mongo.Collection
-	esClient   *elasticsearch.Client
-	tokenStore TokenStore
+	mongoColl   *mongo.Collection
+	esClient    *elasticsearch.Client
+	tokenStore  TokenStore
+
+	// postSyncClusterTime is set by FullSync so that the next runOnce call
+	// opens the change stream with SetStartAtOperationTime instead of
+	// SetResumeAfter.  This guarantees no gap between the full scan and the
+	// first live event.  runOnce clears the field after consuming it.
+	postSyncClusterTime *primitive.Timestamp
 }
 
 // New dials both MongoDB and Elasticsearch (with retry) and returns a ready
@@ -172,18 +179,64 @@ func (r *Replicator) Close() {
 // Run is the service's main loop. It opens the change stream, processes
 // events, and automatically reconnects (with backoff) whenever the stream or
 // the Elasticsearch connection is lost.  It returns only when ctx is cancelled.
+//
+// If STARTUP_FULL_SYNC=true the service performs a full collection scan before
+// opening the change stream on the very first iteration.  Subsequent
+// reconnection cycles (after errors) do NOT repeat the full sync unless a
+// stale-token error triggers one automatically.
 func (r *Replicator) Run(ctx context.Context) error {
+	firstRun := true
+
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+
+		// On the very first run, honour STARTUP_FULL_SYNC.
+		if firstRun && r.cfg.StartupFullSync {
+			r.logger.Info("startup full sync requested")
+			if err := r.FullSync(ctx); err != nil {
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					return ctx.Err()
+				}
+				r.logger.Error("startup full sync failed, will retry after backoff", "error", err)
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(backoffDelay(r.cfg.InitialBackoff, r.cfg.MaxBackoff, 0)):
+				}
+				continue // retry the full sync
+			}
+		}
+		firstRun = false
 
 		err := r.runOnce(ctx)
 		if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return ctx.Err()
 		}
 
-		r.logger.Error("replication cycle ended with error, restarting", "error", err)
+		// If the oplog has rolled past our resume token, optionally do a full
+		// resync before reopening the stream (controlled by STALE_TOKEN_RESYNC).
+		if isStaleResumeTokenError(err) {
+			if !r.cfg.StaleTokenResync {
+				r.logger.Error("resume token is stale and STALE_TOKEN_RESYNC=false — exiting",
+					"error", err,
+					"hint", "set STALE_TOKEN_RESYNC=true or STARTUP_FULL_SYNC=true to recover automatically",
+				)
+				return fmt.Errorf("stale resume token (automatic resync disabled): %w", err)
+			}
+			r.logger.Warn("resume token is no longer in the oplog — triggering full sync to recover",
+				"error", err)
+			if syncErr := r.FullSync(ctx); syncErr != nil {
+				if errors.Is(syncErr, context.Canceled) || errors.Is(syncErr, context.DeadlineExceeded) {
+					return ctx.Err()
+				}
+				r.logger.Error("full sync after stale token failed", "error", syncErr)
+			}
+			// Fall through to the reconnect delay and reopen the stream.
+		} else {
+			r.logger.Error("replication cycle ended with error, restarting", "error", err)
+		}
 
 		// Brief pause before reconnecting to avoid a tight spin on persistent errors.
 		select {
@@ -197,24 +250,45 @@ func (r *Replicator) Run(ctx context.Context) error {
 // runOnce opens a single change-stream session and processes events until the
 // context is cancelled or an unrecoverable error occurs.
 func (r *Replicator) runOnce(ctx context.Context) error {
-	// ── Load resume token ─────────────────────────────────────────────────────
-	resumeToken, err := r.tokenStore.Load()
-	if err != nil {
-		r.logger.Warn("could not load resume token, starting from now", "error", err)
-	}
+	// ── Determine stream start position ──────────────────────────────────────
+	// Priority order:
+	//   1. postSyncClusterTime set by FullSync  → SetStartAtOperationTime
+	//   2. Saved resume token (real change-stream token) → SetResumeAfter
+	//   3. Nothing                              → start from "now"
 
-	// ── Build change-stream options ───────────────────────────────────────────
-	// "updateLookup" causes MongoDB to include the current full document in
-	// update events so we can push the complete document to Elasticsearch.
 	csOpts := options.ChangeStream().
 		SetFullDocument(options.UpdateLookup).
 		SetMaxAwaitTime(10 * time.Second)
 
-	if resumeToken != nil {
-		csOpts.SetResumeAfter(resumeToken)
-		r.logger.Info("resuming change stream from saved token")
+	// Consume the post-sync cluster time if FullSync just ran.
+	if r.postSyncClusterTime != nil {
+		ts := r.postSyncClusterTime
+		r.postSyncClusterTime = nil // consume once
+		csOpts.SetStartAtOperationTime(ts)
+		r.logger.Info("opening change stream at post-sync cluster time",
+			"t", ts.T, "i", ts.I)
 	} else {
-		r.logger.Info("opening change stream from the current cluster time")
+		resumeToken, err := r.tokenStore.Load()
+		if err != nil {
+			r.logger.Warn("could not load resume token, starting from now", "error", err)
+		}
+		switch {
+		case resumeToken != nil && isSyncMarkerToken(resumeToken):
+			// The stored token is a sync-marker (FullSync ran previously but
+			// the process was restarted before runOnce consumed postSyncClusterTime).
+			if ts, ok := clusterTimeFromSyncToken(resumeToken); ok {
+				csOpts.SetStartAtOperationTime(ts)
+				r.logger.Info("opening change stream at persisted cluster time (from sync marker)",
+					"t", ts.T, "i", ts.I)
+			} else {
+				r.logger.Warn("sync marker token has no cluster time, starting from now")
+			}
+		case resumeToken != nil:
+			csOpts.SetResumeAfter(resumeToken)
+			r.logger.Info("resuming change stream from saved resume token")
+		default:
+			r.logger.Info("opening change stream from the current cluster time (no token)")
+		}
 	}
 
 	// Filter only the operation types we care about.
@@ -434,6 +508,36 @@ func (r *Replicator) deleteDocument(ctx context.Context, id string, log *slog.Lo
 
 	log.Info("document deleted", "es_id", id, "index", r.cfg.ESIndex)
 	return nil
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Error classification
+// ─────────────────────────────────────────────────────────────────────────────
+
+// isStaleResumeTokenError reports whether err indicates that the saved resume
+// token is no longer present in the MongoDB oplog.  This happens when the
+// service was down longer than the oplog retention window.
+//
+// Known error codes:
+//   - 136  CappedPositionLost      – oplog (a capped collection) rolled past the token
+//   - 280  ChangeStreamFatalError  – generic fatal change-stream error
+//   - 286  ChangeStreamHistoryLost – explicit "history lost" error (MongoDB 6+)
+func isStaleResumeTokenError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var cmdErr mongo.CommandError
+	if errors.As(err, &cmdErr) {
+		switch cmdErr.Code {
+		case 136, 280, 286:
+			return true
+		}
+	}
+	// Fallback: check the error string for older driver / server versions.
+	msg := err.Error()
+	return strings.Contains(msg, "resume point may no longer be in the oplog") ||
+		strings.Contains(msg, "ChangeStreamHistoryLost") ||
+		strings.Contains(msg, "CappedPositionLost")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

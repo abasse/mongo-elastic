@@ -38,6 +38,9 @@ func main() {
 		"initial_backoff", cfg.InitialBackoff.String(),
 		"max_backoff", cfg.MaxBackoff.String(),
 		"token_save_interval", cfg.TokenSaveInterval,
+		"startup_full_sync", cfg.StartupFullSync,
+		"stale_token_resync", cfg.StaleTokenResync,
+		"sync_batch_size", cfg.SyncBatchSize,
 	)
 
 	// ── Build replicator (dials both backends with retry) ─────────────────────
