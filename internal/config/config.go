@@ -17,23 +17,29 @@ const (
 	TokenStoreMongo TokenStoreType = "mongo"
 )
 
+// CollectionMapping pairs a MongoDB collection name with its target
+// Elasticsearch index name.
+type CollectionMapping struct {
+	Collection string // MongoDB collection name
+	Index      string // Elasticsearch index name (defaults to Collection)
+}
+
 // Config holds all runtime configuration for the replicator.
 type Config struct {
 	// MongoDB
-	MongoURI        string
-	MongoDB         string
-	MongoCollection string
+	MongoURI    string
+	MongoDB     string
+	Collections []CollectionMapping // one entry per watched collection
 
 	// Elasticsearch
 	ESAddresses []string
 	ESUsername  string
 	ESPassword  string
-	ESIndex     string
 
 	// Resume-token storage
 	TokenStore     TokenStoreType
-	TokenFilePath  string // used when TokenStore == "file"
-	TokenMongoMeta string // metadata collection name, used when TokenStore == "mongo"
+	TokenFilePath  string // base path when TokenStore == "file"
+	TokenMongoMeta string // metadata collection name when TokenStore == "mongo"
 
 	// Retry / backoff
 	MaxRetries     int
@@ -50,14 +56,10 @@ type Config struct {
 	// StartupFullSync (STARTUP_FULL_SYNC) forces a complete MongoDB→ES
 	// collection scan on the first startup iteration, before the change stream
 	// opens.  Safe because all operations are idempotent upserts.
-	// Use when you cannot guarantee the service was down for less time than
-	// the MongoDB oplog retention window.
 	StartupFullSync bool
 
 	// StaleTokenResync (STALE_TOKEN_RESYNC) enables automatic full-resync when
-	// the saved resume token is no longer present in the oplog (the service
-	// was down longer than the oplog window).  When disabled, the service logs
-	// the error and exits instead of resyncing.
+	// the saved resume token is no longer in the oplog.
 	// Default: true (recommended).
 	StaleTokenResync bool
 
@@ -67,15 +69,22 @@ type Config struct {
 }
 
 // Load reads configuration from environment variables, applying defaults.
+//
+// Collection mappings are specified via COLLECTIONS as a comma-separated list
+// of "collection:index" pairs.  The index part is optional and defaults to the
+// collection name when omitted:
+//
+//	COLLECTIONS=orders:orders_index,products,users:user_profiles
+//
+// For single-collection deployments the legacy MONGO_COLLECTION / ES_INDEX
+// variables are still accepted as a fallback when COLLECTIONS is not set.
 func Load() (*Config, error) {
 	cfg := &Config{
 		MongoURI:          getEnv("MONGO_URI", "mongodb://localhost:27017"),
 		MongoDB:           getEnv("MONGO_DB", "mydb"),
-		MongoCollection:   getEnv("MONGO_COLLECTION", "mycollection"),
 		ESAddresses:       splitCSV(getEnv("ES_ADDRESSES", "http://localhost:9200")),
 		ESUsername:        getEnv("ES_USERNAME", ""),
 		ESPassword:        getEnv("ES_PASSWORD", ""),
-		ESIndex:           getEnv("ES_INDEX", ""),
 		TokenStore:        TokenStoreType(getEnv("TOKEN_STORE", string(TokenStoreFile))),
 		TokenFilePath:     getEnv("TOKEN_FILE", "resume_token.json"),
 		TokenMongoMeta:    getEnv("TOKEN_MONGO_META_COLLECTION", "_replicator_meta"),
@@ -83,20 +92,45 @@ func Load() (*Config, error) {
 		InitialBackoff:    getEnvDuration("INITIAL_BACKOFF", 500*time.Millisecond),
 		MaxBackoff:        getEnvDuration("MAX_BACKOFF", 30*time.Second),
 		TokenSaveInterval: getEnvInt("TOKEN_SAVE_INTERVAL", 1),
-		StartupFullSync:  getEnvBool("STARTUP_FULL_SYNC", false),
-		StaleTokenResync: getEnvBool("STALE_TOKEN_RESYNC", true),
-		SyncBatchSize:    getEnvInt("SYNC_BATCH_SIZE", 500),
+		StartupFullSync:   getEnvBool("STARTUP_FULL_SYNC", false),
+		StaleTokenResync:  getEnvBool("STALE_TOKEN_RESYNC", true),
+		SyncBatchSize:     getEnvInt("SYNC_BATCH_SIZE", 500),
 	}
 
-	// Default ES index to collection name when not explicitly set.
-	if cfg.ESIndex == "" {
-		cfg.ESIndex = cfg.MongoCollection
+	// ── Resolve collection mappings ───────────────────────────────────────────
+	if raw := os.Getenv("COLLECTIONS"); raw != "" {
+		cfg.Collections = parseCollections(raw)
+	} else {
+		// Legacy single-collection fallback.
+		col := getEnv("MONGO_COLLECTION", "mycollection")
+		idx := getEnv("ES_INDEX", col)
+		cfg.Collections = []CollectionMapping{{Collection: col, Index: idx}}
 	}
 
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
 	return cfg, nil
+}
+
+// parseCollections parses a comma-separated list of "collection[:index]" pairs.
+// When the index part is absent the collection name is used as the index name.
+func parseCollections(raw string) []CollectionMapping {
+	var out []CollectionMapping
+	for _, part := range splitCSV(raw) {
+		if i := strings.IndexByte(part, ':'); i >= 0 {
+			col := strings.TrimSpace(part[:i])
+			idx := strings.TrimSpace(part[i+1:])
+			if idx == "" {
+				idx = col
+			}
+			out = append(out, CollectionMapping{Collection: col, Index: idx})
+		} else {
+			name := strings.TrimSpace(part)
+			out = append(out, CollectionMapping{Collection: name, Index: name})
+		}
+	}
+	return out
 }
 
 func (c *Config) validate() error {
@@ -106,8 +140,16 @@ func (c *Config) validate() error {
 	if c.MongoDB == "" {
 		return fmt.Errorf("MONGO_DB must not be empty")
 	}
-	if c.MongoCollection == "" {
-		return fmt.Errorf("MONGO_COLLECTION must not be empty")
+	if len(c.Collections) == 0 {
+		return fmt.Errorf("at least one collection must be configured via COLLECTIONS or MONGO_COLLECTION")
+	}
+	for i, m := range c.Collections {
+		if m.Collection == "" {
+			return fmt.Errorf("collections[%d]: collection name must not be empty", i)
+		}
+		if m.Index == "" {
+			return fmt.Errorf("collections[%d]: index name must not be empty", i)
+		}
 	}
 	if len(c.ESAddresses) == 0 {
 		return fmt.Errorf("ES_ADDRESSES must not be empty")

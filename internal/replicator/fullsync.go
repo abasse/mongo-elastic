@@ -25,18 +25,13 @@ import (
 //     change stream opens with SetStartAtOperationTime(T0).  Any events
 //     that arrived during the scan (T0 → scan-end) will be replayed once,
 //     but because upsert/delete are idempotent this is harmless.
-func (r *Replicator) FullSync(ctx context.Context) error {
+func (w *collectionWorker) FullSync(ctx context.Context) error {
 	start := time.Now()
-	log := r.logger.With(
-		slog.String("db", r.cfg.MongoDB),
-		slog.String("collection", r.cfg.MongoCollection),
-		slog.String("index", r.cfg.ESIndex),
-		slog.Int("batch_size", r.cfg.SyncBatchSize),
-	)
+	log := w.logger.With(slog.Int("batch_size", w.cfg.SyncBatchSize))
 	log.Info("full sync starting")
 
 	// ── 1. Capture cluster time BEFORE the scan ───────────────────────────────
-	clusterTS, err := r.currentClusterTime(ctx)
+	clusterTS, err := w.currentClusterTime(ctx)
 	if err != nil {
 		return fmt.Errorf("full sync: get cluster time: %w", err)
 	}
@@ -44,10 +39,10 @@ func (r *Replicator) FullSync(ctx context.Context) error {
 
 	// ── 2. Iterate the collection ─────────────────────────────────────────────
 	findOpts := options.Find().
-		SetBatchSize(int32(r.cfg.SyncBatchSize)).
+		SetBatchSize(int32(w.cfg.SyncBatchSize)).
 		SetNoCursorTimeout(false)
 
-	cursor, err := r.mongoColl.Find(ctx, bson.D{}, findOpts)
+	cursor, err := w.mongoColl.Find(ctx, bson.D{}, findOpts)
 	if err != nil {
 		return fmt.Errorf("full sync: find: %w", err)
 	}
@@ -64,7 +59,7 @@ func (r *Replicator) FullSync(ctx context.Context) error {
 		if len(batch) == 0 {
 			return nil
 		}
-		ok, ko, err := r.bulkIndex(ctx, batch)
+		ok, ko, err := w.bulkIndex(ctx, batch)
 		succeeded += ok
 		failed += ko
 		batch = batch[:0]
@@ -98,7 +93,7 @@ func (r *Replicator) FullSync(ctx context.Context) error {
 		batch = append(batch, bulkItem{id: docID, body: docJSON})
 		total++
 
-		if len(batch) >= r.cfg.SyncBatchSize {
+		if len(batch) >= w.cfg.SyncBatchSize {
 			if err := flush(); err != nil {
 				return fmt.Errorf("full sync: bulk flush: %w", err)
 			}
@@ -118,10 +113,10 @@ func (r *Replicator) FullSync(ctx context.Context) error {
 	if tokenErr != nil {
 		log.Warn("could not encode sync-marker token; stream will start from 'now'", "error", tokenErr)
 	} else {
-		if serr := r.tokenStore.Save(markerToken); serr != nil {
+		if serr := w.tokenStore.Save(markerToken); serr != nil {
 			log.Warn("could not save sync-marker token", "error", serr)
 		}
-		r.postSyncClusterTime = clusterTS
+		w.postSyncClusterTime = clusterTS
 	}
 
 	log.Info("full sync complete",
@@ -149,7 +144,7 @@ type bulkItem struct {
 // bulkIndex sends a single Elasticsearch bulk request for all items.
 // Per-document failures are logged but do not cause a fatal error.
 // Returns (succeeded, failed, fatalErr).
-func (r *Replicator) bulkIndex(ctx context.Context, items []bulkItem) (succeeded, failed int, _ error) {
+func (w *collectionWorker) bulkIndex(ctx context.Context, items []bulkItem) (succeeded, failed int, _ error) {
 	if len(items) == 0 {
 		return 0, 0, nil
 	}
@@ -162,10 +157,10 @@ func (r *Replicator) bulkIndex(ctx context.Context, items []bulkItem) (succeeded
 		buf.WriteByte('\n')
 	}
 
-	res, err := r.esClient.Bulk(
+	res, err := w.esClient.Bulk(
 		bytes.NewReader(buf.Bytes()),
-		r.esClient.Bulk.WithContext(ctx),
-		r.esClient.Bulk.WithIndex(r.cfg.ESIndex),
+		w.esClient.Bulk.WithContext(ctx),
+		w.esClient.Bulk.WithIndex(w.mapping.Index),
 	)
 	if err != nil {
 		return 0, len(items), fmt.Errorf("bulk transport: %w", err)
@@ -173,7 +168,6 @@ func (r *Replicator) bulkIndex(ctx context.Context, items []bulkItem) (succeeded
 	defer res.Body.Close()
 
 	body, _ := io.ReadAll(res.Body)
-
 	if res.IsError() {
 		return 0, len(items), fmt.Errorf("bulk HTTP %s: %s", res.Status(), body)
 	}
@@ -191,8 +185,7 @@ func (r *Replicator) bulkIndex(ctx context.Context, items []bulkItem) (succeeded
 		} `json:"items"`
 	}
 	if err := json.Unmarshal(body, &bulkResp); err != nil {
-		// Cannot parse — assume all succeeded (transport-level check already passed).
-		r.logger.Warn("could not parse bulk response", "error", err)
+		w.logger.Warn("could not parse bulk response", "error", err)
 		return len(items), 0, nil
 	}
 
@@ -200,7 +193,7 @@ func (r *Replicator) bulkIndex(ctx context.Context, items []bulkItem) (succeeded
 		for action, result := range item {
 			if result.Error != nil {
 				failed++
-				r.logger.Error("bulk item failed",
+				w.logger.Error("bulk item failed",
 					"action", action,
 					"id", result.ID,
 					"status", result.Status,
@@ -220,11 +213,10 @@ func (r *Replicator) bulkIndex(ctx context.Context, items []bulkItem) (succeeded
 // ─────────────────────────────────────────────────────────────────────────────
 
 // currentClusterTime returns the server's cluster time via the lightweight
-// "hello" command. Falls back to the local wall clock when the server response
-// doesn't include operationTime (e.g. standalone nodes without sessions).
-func (r *Replicator) currentClusterTime(ctx context.Context) (*primitive.Timestamp, error) {
+// "hello" command, falling back to the local wall clock.
+func (w *collectionWorker) currentClusterTime(ctx context.Context) (*primitive.Timestamp, error) {
 	var result bson.Raw
-	err := r.mongoClient.
+	err := w.mongoClient.
 		Database("admin").
 		RunCommand(ctx, bson.D{{Key: "hello", Value: 1}}).
 		Decode(&result)
@@ -235,7 +227,7 @@ func (r *Replicator) currentClusterTime(ctx context.Context) (*primitive.Timesta
 		}
 	}
 
-	r.logger.Warn("cannot read cluster time from server, using wall clock", "error", err)
+	w.logger.Warn("cannot read cluster time from server, using wall clock", "error", err)
 	return &primitive.Timestamp{T: uint32(time.Now().Unix()), I: 0}, nil
 }
 
@@ -266,8 +258,7 @@ func isSyncMarkerToken(token bson.Raw) bool {
 	return ok && b
 }
 
-// clusterTimeFromSyncToken extracts the timestamp embedded in a sync-marker
-// token.
+// clusterTimeFromSyncToken extracts the timestamp embedded in a sync-marker token.
 func clusterTimeFromSyncToken(token bson.Raw) (*primitive.Timestamp, bool) {
 	v, err := token.LookupErr("clusterTime")
 	if err != nil {

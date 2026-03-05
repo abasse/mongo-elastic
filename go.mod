@@ -5,6 +5,7 @@ go 1.24
 require (
 	github.com/elastic/go-elasticsearch/v8 v8.19.3
 	go.mongodb.org/mongo-driver v1.17.9
+	golang.org/x/sync v0.8.0
 )
 
 require (
@@ -22,6 +23,5 @@ require (
 	go.opentelemetry.io/otel/metric v1.28.0 // indirect
 	go.opentelemetry.io/otel/trace v1.28.0 // indirect
 	golang.org/x/crypto v0.26.0 // indirect
-	golang.org/x/sync v0.8.0 // indirect
 	golang.org/x/text v0.17.0 // indirect
 )

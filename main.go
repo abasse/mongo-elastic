@@ -1,5 +1,5 @@
-// Command mongo-elastic replicates a MongoDB collection to Elasticsearch in
-// real-time using MongoDB Change Streams.
+// Command mongo-elastic replicates one or more MongoDB collections to
+// Elasticsearch in real-time using MongoDB Change Streams.
 package main
 
 import (
@@ -27,12 +27,17 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Build a human-readable "col→idx" summary for the startup log.
+	collectionSummary := make([]string, 0, len(cfg.Collections))
+	for _, m := range cfg.Collections {
+		collectionSummary = append(collectionSummary, m.Collection+"→"+m.Index)
+	}
+
 	logger.Info("mongo-elastic replicator starting",
 		"mongo_uri", cfg.MongoURI,
 		"mongo_db", cfg.MongoDB,
-		"mongo_collection", cfg.MongoCollection,
+		"collections", collectionSummary,
 		"es_addresses", cfg.ESAddresses,
-		"es_index", cfg.ESIndex,
 		"token_store", cfg.TokenStore,
 		"max_retries", cfg.MaxRetries,
 		"initial_backoff", cfg.InitialBackoff.String(),

@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -15,7 +17,7 @@ import (
 )
 
 // TokenStore persists and retrieves the MongoDB change-stream resume token.
-// Implementations must be safe to call concurrently from a single goroutine.
+// Each collection has its own TokenStore instance so tokens never collide.
 type TokenStore interface {
 	// Save persists the resume token returned by ChangeStream.ResumeToken().
 	Save(token bson.Raw) error
@@ -40,9 +42,25 @@ type FileTokenStore struct {
 	logger *slog.Logger
 }
 
-// NewFileTokenStore creates a FileTokenStore that reads/writes at path.
-func NewFileTokenStore(path string, logger *slog.Logger) *FileTokenStore {
-	return &FileTokenStore{path: path, logger: logger}
+// NewFileTokenStore creates a FileTokenStore for the given collection.
+// The token file path is derived from basePath by inserting the collection
+// name before the extension, e.g.:
+//
+//	"resume_token.json" + "orders"  →  "resume_token_orders.json"
+//	"/data/tok"         + "orders"  →  "/data/tok_orders"
+func NewFileTokenStore(basePath, collection string, logger *slog.Logger) *FileTokenStore {
+	return &FileTokenStore{
+		path:   collectionTokenPath(basePath, collection),
+		logger: logger,
+	}
+}
+
+// collectionTokenPath inserts the collection name into a base file path before
+// the extension (or at the end when there is no extension).
+func collectionTokenPath(basePath, collection string) string {
+	ext := filepath.Ext(basePath)
+	base := strings.TrimSuffix(basePath, ext)
+	return fmt.Sprintf("%s_%s%s", base, collection, ext)
 }
 
 // Save writes the resume token to disk atomically (write-then-rename).
@@ -56,7 +74,6 @@ func (f *FileTokenStore) Save(token bson.Raw) error {
 		return fmt.Errorf("token marshal: %w", err)
 	}
 
-	// Write to a temp file first, then rename for atomicity.
 	tmp := f.path + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return fmt.Errorf("token write: %w", err)
@@ -93,24 +110,31 @@ func (f *FileTokenStore) Load() (bson.Raw, error) {
 // MongoTokenStore
 // ─────────────────────────────────────────────────────────────────────────────
 
-const metaDocID = "change_stream_token"
-
 type mongoTokenDoc struct {
 	ID      string    `bson:"_id"`
 	Token   bson.Raw  `bson:"token"`
 	SavedAt time.Time `bson:"saved_at"`
 }
 
-// MongoTokenStore persists the resume token in a dedicated MongoDB collection.
-// This is the preferred option when the service runs in a stateless container.
+// MongoTokenStore persists the resume token as a document in a dedicated
+// MongoDB collection.  Each watched collection's token is stored under a
+// unique document ID so multiple collections can share the same metadata
+// collection.
 type MongoTokenStore struct {
 	coll   *mongo.Collection
+	docID  string // "token_<collection>" — unique per watched collection
 	logger *slog.Logger
 }
 
-// NewMongoTokenStore creates a MongoTokenStore backed by coll.
-func NewMongoTokenStore(coll *mongo.Collection, logger *slog.Logger) *MongoTokenStore {
-	return &MongoTokenStore{coll: coll, logger: logger}
+// NewMongoTokenStore creates a MongoTokenStore for the given collection.
+// All per-collection tokens are stored as separate documents inside metaColl,
+// keyed by "token_<collection>".
+func NewMongoTokenStore(metaColl *mongo.Collection, collection string, logger *slog.Logger) *MongoTokenStore {
+	return &MongoTokenStore{
+		coll:   metaColl,
+		docID:  "token_" + collection,
+		logger: logger,
+	}
 }
 
 // Save upserts the resume token into the metadata collection.
@@ -119,11 +143,11 @@ func (m *MongoTokenStore) Save(token bson.Raw) error {
 	defer cancel()
 
 	doc := mongoTokenDoc{
-		ID:      metaDocID,
+		ID:      m.docID,
 		Token:   token,
 		SavedAt: time.Now().UTC(),
 	}
-	filter := bson.D{{Key: "_id", Value: metaDocID}}
+	filter := bson.D{{Key: "_id", Value: m.docID}}
 	update := bson.D{{Key: "$set", Value: doc}}
 	opts := options.Update().SetUpsert(true)
 
@@ -139,16 +163,18 @@ func (m *MongoTokenStore) Load() (bson.Raw, error) {
 	defer cancel()
 
 	var doc mongoTokenDoc
-	filter := bson.D{{Key: "_id", Value: metaDocID}}
+	filter := bson.D{{Key: "_id", Value: m.docID}}
 	err := m.coll.FindOne(ctx, filter).Decode(&doc)
 	if errors.Is(err, mongo.ErrNoDocuments) {
-		m.logger.Info("no resume token in metadata collection, starting from the beginning")
+		m.logger.Info("no resume token in metadata collection, starting from the beginning",
+			"doc_id", m.docID)
 		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("token load: %w", err)
 	}
 
-	m.logger.Info("loaded resume token from MongoDB", "collection", m.coll.Name(), "saved_at", doc.SavedAt)
+	m.logger.Info("loaded resume token from MongoDB",
+		"collection", m.coll.Name(), "doc_id", m.docID, "saved_at", doc.SavedAt)
 	return doc.Token, nil
 }
