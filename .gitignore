@@ -1,0 +1,12 @@
+# Binary
+mongo-elastic
+
+# Environment / secrets
+.env
+
+# Resume token (local file store)
+resume_token.json
+resume_token.json.tmp
+
+# Go build cache
+vendor/

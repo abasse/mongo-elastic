@@ -1,0 +1,85 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# mongo-elastic: MongoDB → Elasticsearch real-time replicator
+#
+# Usage:
+#   docker compose up -d
+#
+# The replicator waits for both MongoDB and Elasticsearch to be healthy before
+# starting.  Copy .env.example to .env and adjust values as needed.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── MongoDB (single-node replica set required for change streams) ────────────
+  mongo:
+    image: mongo:7
+    container_name: mongo
+    command: ["--replSet", "rs0", "--bind_ip_all"]
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+      - ./scripts/mongo-init.js:/docker-entrypoint-initdb.d/rs-init.js:ro
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ── Elasticsearch ────────────────────────────────────────────────────────────
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.0
+    container_name: elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - "9200:9200"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 40s
+
+  # ── Kibana (optional, for exploring replicated data) ─────────────────────────
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.13.0
+    container_name: kibana
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    ports:
+      - "5601:5601"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    profiles:
+      - kibana
+
+  # ── Replicator ───────────────────────────────────────────────────────────────
+  replicator:
+    build: .
+    container_name: mongo-elastic-replicator
+    env_file: .env
+    environment:
+      MONGO_URI: mongodb://mongo:27017/?replicaSet=rs0
+      ES_ADDRESSES: http://elasticsearch:9200
+    volumes:
+      - replicator_data:/data
+    depends_on:
+      mongo:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  mongo_data:
+  es_data:
+  replicator_data:
