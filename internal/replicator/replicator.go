@@ -135,9 +135,21 @@ func New(cfg *config.Config, logger *slog.Logger) (*Replicator, error) {
 		)
 
 		var tokenStore TokenStore
-		if cfg.TokenStore == config.TokenStoreMongo {
+		switch cfg.TokenStore {
+		case config.TokenStoreMongo:
 			tokenStore = NewMongoTokenStore(metaColl, mapping.Collection, wlog)
-		} else {
+		case config.TokenStoreS3:
+			ts, err := NewS3TokenStore(
+				context.Background(),
+				cfg.TokenS3Bucket, cfg.TokenS3Prefix, cfg.TokenS3Region,
+				mapping.Collection, wlog,
+			)
+			if err != nil {
+				_ = mongoClient.Disconnect(context.Background())
+				return nil, fmt.Errorf("create S3 token store for %q: %w", mapping.Collection, err)
+			}
+			tokenStore = ts
+		default:
 			tokenStore = NewFileTokenStore(cfg.TokenFilePath, mapping.Collection, wlog)
 		}
 
