@@ -15,6 +15,7 @@ type TokenStoreType string
 const (
 	TokenStoreFile  TokenStoreType = "file"
 	TokenStoreMongo TokenStoreType = "mongo"
+	TokenStoreS3    TokenStoreType = "s3"
 )
 
 // CollectionMapping pairs a MongoDB collection name with its target
@@ -40,6 +41,9 @@ type Config struct {
 	TokenStore     TokenStoreType
 	TokenFilePath  string // base path when TokenStore == "file"
 	TokenMongoMeta string // metadata collection name when TokenStore == "mongo"
+	TokenS3Bucket  string // S3 bucket name when TokenStore == "s3"
+	TokenS3Prefix  string // S3 key prefix when TokenStore == "s3" (default: "mongo-elastic/")
+	TokenS3Region  string // AWS region override; empty = use SDK default chain
 
 	// Retry / backoff
 	MaxRetries     int
@@ -88,6 +92,9 @@ func Load() (*Config, error) {
 		TokenStore:        TokenStoreType(getEnv("TOKEN_STORE", string(TokenStoreFile))),
 		TokenFilePath:     getEnv("TOKEN_FILE", "resume_token.json"),
 		TokenMongoMeta:    getEnv("TOKEN_MONGO_META_COLLECTION", "_replicator_meta"),
+		TokenS3Bucket:     getEnv("TOKEN_S3_BUCKET", ""),
+		TokenS3Prefix:     getEnv("TOKEN_S3_PREFIX", "mongo-elastic/"),
+		TokenS3Region:     getEnv("TOKEN_S3_REGION", ""),
 		MaxRetries:        getEnvInt("MAX_RETRIES", 10),
 		InitialBackoff:    getEnvDuration("INITIAL_BACKOFF", 500*time.Millisecond),
 		MaxBackoff:        getEnvDuration("MAX_BACKOFF", 30*time.Second),
@@ -154,8 +161,11 @@ func (c *Config) validate() error {
 	if len(c.ESAddresses) == 0 {
 		return fmt.Errorf("ES_ADDRESSES must not be empty")
 	}
-	if c.TokenStore != TokenStoreFile && c.TokenStore != TokenStoreMongo {
-		return fmt.Errorf("TOKEN_STORE must be 'file' or 'mongo', got %q", c.TokenStore)
+	if c.TokenStore != TokenStoreFile && c.TokenStore != TokenStoreMongo && c.TokenStore != TokenStoreS3 {
+		return fmt.Errorf("TOKEN_STORE must be 'file', 'mongo', or 's3', got %q", c.TokenStore)
+	}
+	if c.TokenStore == TokenStoreS3 && c.TokenS3Bucket == "" {
+		return fmt.Errorf("TOKEN_S3_BUCKET must be set when TOKEN_STORE=s3")
 	}
 	if c.MaxRetries < 0 {
 		return fmt.Errorf("MAX_RETRIES must be >= 0")

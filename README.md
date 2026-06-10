@@ -173,10 +173,57 @@ Each collection stores its resume token independently, so a restart mid-way thro
 
 | Variable | Default | Description |
 |---|---|---|
-| `TOKEN_STORE` | `file` | `file` — write a JSON file per collection (e.g. `resume_token_orders.json`). `mongo` — upsert a document per collection into a metadata collection; recommended for stateless containers. |
+| `TOKEN_STORE` | `file` | `file` — write a JSON file per collection (e.g. `resume_token_orders.json`). `mongo` — upsert a document per collection into a metadata collection; recommended for stateless containers. `s3` — store tokens as JSON objects in an S3 bucket; ideal for serverless or ephemeral deployments. |
 | `TOKEN_FILE` | `resume_token.json` | Base path for token files when `TOKEN_STORE=file`. The collection name is inserted before the extension: `resume_token.json` + `orders` → `resume_token_orders.json`. |
 | `TOKEN_MONGO_META_COLLECTION` | `_replicator_meta` | Metadata collection used when `TOKEN_STORE=mongo`. Each collection's token is a separate document (`token_orders`, `token_products`, …). |
+| `TOKEN_S3_BUCKET` | *(required for s3)* | S3 bucket name when `TOKEN_STORE=s3`. |
+| `TOKEN_S3_PREFIX` | `mongo-elastic/` | S3 key prefix when `TOKEN_STORE=s3`. Each collection's token is stored as `<prefix><collection>.json`, e.g. `mongo-elastic/orders.json`. |
+| `TOKEN_S3_REGION` | *(SDK default)* | AWS region override for `TOKEN_STORE=s3`. When empty the SDK resolves the region via `AWS_DEFAULT_REGION`, `~/.aws/config`, or EC2/ECS instance metadata. |
 | `TOKEN_SAVE_INTERVAL` | `1` | Save the token every N events. `1` gives maximum durability; higher values reduce I/O at the cost of replaying more events after a crash. |
+
+#### S3 token store — AWS credentials
+
+Credentials are resolved automatically by the AWS SDK default credential chain:
+
+1. `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` environment variables
+2. `~/.aws/credentials` and `~/.aws/config` files
+3. ECS task role or EC2/EKS instance profile (IAM role)
+
+The IAM principal needs only `s3:GetObject` and `s3:PutObject` on the token objects:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": ["s3:GetObject", "s3:PutObject"],
+  "Resource": "arn:aws:s3:::my-token-bucket/mongo-elastic/*"
+}
+```
+
+#### S3 token store — example
+
+```bash
+TOKEN_STORE=s3
+TOKEN_S3_BUCKET=my-token-bucket
+TOKEN_S3_PREFIX=mongo-elastic/prod/   # optional, default: mongo-elastic/
+TOKEN_S3_REGION=us-east-1             # optional
+
+# Standard AWS credential env vars (or use IAM role / ~/.aws/credentials)
+AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
+AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+```
+
+With `COLLECTIONS=orders,products` the replicator stores two objects:
+
+```
+s3://my-token-bucket/mongo-elastic/prod/orders.json
+s3://my-token-bucket/mongo-elastic/prod/products.json
+```
+
+Each object is a small JSON document:
+
+```json
+{"saved_at":"2024-06-01T12:00:00Z","token":"<base64-encoded BSON>"}
+```
 
 ### Resiliency
 
@@ -268,7 +315,8 @@ mongo-elastic/
 │       ├── fullsync.go             # FullSync: full collection scan + ES bulk indexer;
 │       │                           # cluster-time / sync-marker token helpers
 │       ├── token.go                # TokenStore interface; FileTokenStore (one file per
-│       │                           # collection); MongoTokenStore (one doc per collection)
+│       │                           # collection); MongoTokenStore (one doc per collection);
+│       │                           # S3TokenStore (one S3 object per collection)
 │       └── backoff.go              # Exponential backoff with jitter
 │
 ├── scripts/
